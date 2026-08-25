@@ -5,8 +5,9 @@
 #include "multi_modal.h"
 #include "models/io/default_position_inputs.h"
 #include "models/io/qwen_vl_position_inputs.h"
-#include <cstring>
 #include <algorithm>
+#include <cstring>
+#include <iostream>
 #include <numeric>
 
 namespace Generators {
@@ -148,6 +149,20 @@ void VisionState::SetExtraInputs(const std::vector<ExtraInput>& extra_inputs, co
 DeviceSpan<float> VisionState::Run(int current_length, DeviceSpan<int32_t>& next_tokens, DeviceSpan<int32_t> next_indices) {
   if (model_.config_->model.vision.run_options.has_value()) {
     State::SetRunOptions(model_.config_->model.vision.run_options.value());
+  }
+
+  std::cerr << "\nVision model inputs:\n";
+  for (size_t i = 0; i < inputs_.size(); ++i) {
+    if (!inputs_[i]) continue;
+
+    const auto info = inputs_[i]->GetTensorTypeAndShapeInfo();
+    const auto shape = info->GetShape();
+    std::cerr << "  " << input_names_[i] << ": [";
+    for (size_t dim = 0; dim < shape.size(); ++dim) {
+      if (dim > 0) std::cerr << ", ";
+      std::cerr << shape[dim];
+    }
+    std::cerr << "]\n";
   }
 
   State::Run(*model_.vision_session_);
