@@ -65,12 +65,12 @@ def _get_test_media_path(test_data_path, relative_path):
     return Path(test_data_path).parent / relative_path
 
 
-def _create_static_batch_vision_model(onnx, output_path):
+def _create_static_batch_vision_model(onnx, output_path, num_patches="num_patches"):
     """Create a static-B=1 vision model that removes padding and pools 3x3 patches."""
     helper = onnx.helper
     tensor_proto = onnx.TensorProto
-    pixel_values = helper.make_tensor_value_info("pixel_values", tensor_proto.FLOAT, [1, "num_patches", 768])
-    position_ids = helper.make_tensor_value_info("pixel_position_ids", tensor_proto.INT64, [1, "num_patches", 2])
+    pixel_values = helper.make_tensor_value_info("pixel_values", tensor_proto.FLOAT, [1, num_patches, 768])
+    position_ids = helper.make_tensor_value_info("pixel_position_ids", tensor_proto.INT64, [1, num_patches, 2])
     image_features = helper.make_tensor_value_info("image_features", tensor_proto.FLOAT, ["num_soft_tokens", 2048])
 
     nodes = [
@@ -323,6 +323,80 @@ def test_gemma4_static_batch_vision_executes_multiple_images(test_data_path, tmp
     params.set_search_options(max_length=4096)
     generator = og.Generator(model, params)
     generator.set_inputs(inputs)
+
+
+@pytest.mark.parametrize(
+    "relative_image_paths",
+    [[Path("images") / "australia.jpg", Path("images") / "sheet.png"]],
+)
+def test_gemma4_fixed_patch_vision_pads_multiple_images(test_data_path, tmp_path, relative_image_paths):
+    """Test that processor output is padded to the vision model's fixed patch capacity."""
+    onnx = pytest.importorskip("onnx")
+    source_model_path = Path(_get_gemma4_model_path(test_data_path))
+    image_paths = [os.fspath(_get_test_media_path(test_data_path, path)) for path in relative_image_paths]
+    images = og.Images.open(*image_paths)
+
+    source_model = og.Model(os.fspath(source_model_path))
+    source_processor = source_model.create_multimodal_processor()
+    source_inputs = source_processor("<|image|><|image|>Compare these images", images=images)
+    image_token_counts = _to_numpy(source_inputs["num_image_tokens"])
+    fixed_num_patches = (int(image_token_counts.max()) + 1) * 9
+
+    model_path = tmp_path / "gemma4"
+    shutil.copytree(source_model_path, model_path)
+    config_path = model_path / "genai_config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["model"]["speech"] = {"filename": "", "config_filename": ""}
+    config["model"]["vocab_size"] = 8
+    config["model"]["eos_token_id"] = [1]
+    config["search"]["past_present_share_buffer"] = False
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    _create_static_batch_vision_model(onnx, model_path / "dummy_vision.onnx", fixed_num_patches)
+    _create_dynamic_embedding_model(onnx, model_path / "dummy_embedding.onnx")
+    _create_dynamic_decoder_model(onnx, model_path / "dummy_text.onnx")
+
+    model = og.Model(os.fspath(model_path))
+    processor = model.create_multimodal_processor()
+    inputs = processor("<|image|><|image|>Compare these images", images=images)
+    pixel_values = _to_numpy(inputs["pixel_values"])
+    pixel_position_ids = _to_numpy(inputs["pixel_position_ids"])
+
+    assert pixel_values.shape == (len(image_paths), fixed_num_patches, 768)
+    assert pixel_position_ids.shape == (len(image_paths), fixed_num_patches, 2)
+    assert np.all(pixel_values[:, -9:, :] == 0)
+    assert np.all(pixel_position_ids[:, -9:, :] == -1)
+    np.testing.assert_array_equal(_to_numpy(inputs["num_image_tokens"]), image_token_counts)
+
+    params = og.GeneratorParams(model)
+    params.set_search_options(max_length=4096)
+    generator = og.Generator(model, params)
+    generator.set_inputs(inputs)
+    generator.generate_next_token()
+
+
+@pytest.mark.parametrize("relative_image_path", [Path("images") / "australia.jpg"])
+def test_gemma4_fixed_patch_vision_rejects_too_many_patches(test_data_path, tmp_path, relative_image_path):
+    """Test that valid image patches are never truncated to fit a fixed vision input."""
+    onnx = pytest.importorskip("onnx")
+    source_model_path = Path(_get_gemma4_model_path(test_data_path))
+    image_path = os.fspath(_get_test_media_path(test_data_path, relative_image_path))
+    images = og.Images.open(image_path)
+
+    source_model = og.Model(os.fspath(source_model_path))
+    source_processor = source_model.create_multimodal_processor()
+    source_inputs = source_processor("<|image|>Describe this image", images=images)
+    actual_num_patches = int(_to_numpy(source_inputs["num_image_tokens"])[0]) * 9
+
+    model_path = tmp_path / "gemma4"
+    shutil.copytree(source_model_path, model_path)
+    _create_static_batch_vision_model(onnx, model_path / "dummy_vision.onnx", actual_num_patches - 9)
+
+    model = og.Model(os.fspath(model_path))
+    processor = model.create_multimodal_processor()
+    with pytest.raises(
+        RuntimeError, match="vision model accepts .* patches, but preprocessing produced .* valid patches"
+    ):
+        processor("<|image|>Describe this image", images=images)
 
 
 @pytest.mark.parametrize("relative_image_path", [Path("images") / "australia.jpg"])
