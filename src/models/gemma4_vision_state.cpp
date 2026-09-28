@@ -18,6 +18,52 @@ struct OrtValuePointerRestore {
   ~OrtValuePointerRestore() { slot = value; }
 };
 
+struct Gemma4VisionStageState final : State {
+  Gemma4VisionStageState(const GeneratorParams& params, const MultiModalLanguageModel& model, OrtSession& session)
+      : State{params, model},
+        session_{session},
+        session_input_names_{session.GetInputNames()} {
+    input_names_.reserve(session_input_names_.size());
+    for (const auto& name : session_input_names_) {
+      input_names_.push_back(name.c_str());
+    }
+  }
+
+  DeviceSpan<float> Run(int, DeviceSpan<int32_t>&, DeviceSpan<int32_t>) override {
+    State::Run(session_);
+    return {};
+  }
+
+  void BindInputs(std::vector<OrtValue*> inputs) {
+    if (inputs.size() != session_input_names_.size()) {
+      throw std::runtime_error("Gemma 4 vision stage input count does not match the ONNX model");
+    }
+    inputs_ = std::move(inputs);
+  }
+
+  std::unique_ptr<OrtValue> RunForOutput(const std::string& output_name) {
+    output_name_ = output_name;
+    output_names_ = {output_name_.c_str()};
+    outputs_ = {nullptr};
+    State::Run(session_);
+    return std::unique_ptr<OrtValue>{outputs_[0]};
+  }
+
+  void RunForOutput(const std::string& output_name, OrtValue* output) {
+    output_name_ = output_name;
+    output_names_ = {output_name_.c_str()};
+    outputs_ = {output};
+    State::Run(session_);
+  }
+
+  const std::vector<std::string>& InputNames() const { return session_input_names_; }
+
+ private:
+  OrtSession& session_;
+  std::vector<std::string> session_input_names_;
+  std::string output_name_;
+};
+
 }  // namespace
 
 void Gemma4VisionState::SetExtraInputs(const std::vector<ExtraInput>& extra_inputs,
@@ -51,7 +97,7 @@ DeviceSpan<float> Gemma4VisionState::Run(int current_length, DeviceSpan<int32_t>
     State::SetRunOptions(model_.config_->model.vision.run_options.value());
   }
 
-  if (num_images_ <= 1) {
+  if (!model_.vision_projector_session_ && num_images_ <= 1) {
     State::Run(*model_.vision_session_);
     return {};
   }
@@ -110,6 +156,46 @@ DeviceSpan<float> Gemma4VisionState::Run(int current_length, DeviceSpan<int32_t>
   }
 
   int64_t feature_offset = 0;
+  std::unique_ptr<Gemma4VisionStageState> encoder_state;
+  std::unique_ptr<Gemma4VisionStageState> projector_state;
+  std::string encoder_output_name;
+  if (model_.vision_projector_session_) {
+    const auto encoder_output_names = model_.vision_session_->GetOutputNames();
+    if (encoder_output_names.size() != 1) {
+      throw std::runtime_error("Gemma 4 vision encoder must have exactly one output");
+    }
+    encoder_output_name = encoder_output_names[0];
+    const auto projector_input_names = model_.vision_projector_session_->GetInputNames();
+    if (std::find(projector_input_names.begin(), projector_input_names.end(),
+                  encoder_output_name) == projector_input_names.end()) {
+      throw std::runtime_error("Gemma 4 vision projector does not consume encoder output " + encoder_output_name);
+    }
+
+    encoder_state = std::make_unique<Gemma4VisionStageState>(*params_, model_, *model_.vision_session_);
+    projector_state =
+        std::make_unique<Gemma4VisionStageState>(*params_, model_, *model_.vision_projector_session_);
+    const auto& vision_pipeline = model_.config_->model.vision.pipeline;
+    if (vision_pipeline[0].run_options.has_value()) {
+      encoder_state->SetRunOptions(vision_pipeline[0].run_options.value());
+    } else if (model_.config_->model.vision.run_options.has_value()) {
+      encoder_state->SetRunOptions(model_.config_->model.vision.run_options.value());
+    }
+    if (vision_pipeline[1].run_options.has_value()) {
+      projector_state->SetRunOptions(vision_pipeline[1].run_options.value());
+    } else if (model_.config_->model.vision.run_options.has_value()) {
+      projector_state->SetRunOptions(model_.config_->model.vision.run_options.value());
+    }
+  }
+
+  const auto find_bound_input = [&](const std::string& name, OrtValue* image_pixel_values,
+                                    OrtValue* image_position_ids, OrtValue* encoder_output) -> OrtValue* {
+    if (name == model_.config_->model.vision.inputs.pixel_values) return image_pixel_values;
+    if (name == model_.config_->model.vision.inputs.pixel_position_ids) return image_position_ids;
+    if (name == encoder_output_name) return encoder_output;
+    if (auto* input = GetInput(name.c_str())) return input;
+    throw std::runtime_error("Missing Gemma 4 vision pipeline input " + name);
+  };
+
   for (int64_t image = 0; image < num_images_; ++image) {
     const int64_t image_tokens = image_token_counts_[static_cast<size_t>(image)];
     if (image_tokens <= 0) {
@@ -132,7 +218,27 @@ DeviceSpan<float> Gemma4VisionState::Run(int current_length, DeviceSpan<int32_t>
     inputs_[pixel_values_index_] = image_pixel_values.get();
     inputs_[position_ids_index_] = image_position_ids.get();
     outputs_[0] = image_feature_values.get();
-    State::Run(*model_.vision_session_);
+    if (encoder_state) {
+      std::vector<OrtValue*> encoder_inputs;
+      encoder_inputs.reserve(encoder_state->InputNames().size());
+      for (const auto& name : encoder_state->InputNames()) {
+        encoder_inputs.push_back(find_bound_input(name, image_pixel_values.get(), image_position_ids.get(), nullptr));
+      }
+      encoder_state->BindInputs(std::move(encoder_inputs));
+      auto encoder_output = encoder_state->RunForOutput(encoder_output_name);
+
+      std::vector<OrtValue*> projector_inputs;
+      projector_inputs.reserve(projector_state->InputNames().size());
+      for (const auto& name : projector_state->InputNames()) {
+        projector_inputs.push_back(
+            find_bound_input(name, image_pixel_values.get(), image_position_ids.get(), encoder_output.get()));
+      }
+      projector_state->BindInputs(std::move(projector_inputs));
+      projector_state->RunForOutput(model_.config_->model.vision.outputs.image_features,
+                                    image_feature_values.get());
+    } else {
+      State::Run(*model_.vision_session_);
+    }
     feature_offset += image_tokens;
   }
 

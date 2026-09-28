@@ -101,6 +101,56 @@ def _create_static_batch_vision_model(onnx, output_path, num_patches="num_patche
     onnx.save(model, output_path)
 
 
+def _create_static_batch_vision_pipeline(onnx, encoder_path, projector_path):
+    """Split the static-B=1 vision fixture at a vision_features boundary."""
+    helper = onnx.helper
+    tensor_proto = onnx.TensorProto
+
+    pixel_values = helper.make_tensor_value_info("pixel_values", tensor_proto.FLOAT, [1, "num_patches", 768])
+    position_ids = helper.make_tensor_value_info("pixel_position_ids", tensor_proto.INT64, [1, "num_patches", 2])
+    vision_features = helper.make_tensor_value_info("vision_features", tensor_proto.FLOAT, [1, "num_patches", 768])
+    encoder_graph = helper.make_graph(
+        [helper.make_node("Identity", ["pixel_values"], ["vision_features"])],
+        "gemma4_vision_encoder",
+        [pixel_values, position_ids],
+        [vision_features],
+    )
+    encoder = helper.make_model(encoder_graph, opset_imports=[helper.make_opsetid("", 14)], ir_version=7)
+    onnx.save(encoder, encoder_path)
+
+    image_features = helper.make_tensor_value_info("image_features", tensor_proto.FLOAT, ["num_soft_tokens", 2048])
+    projector_nodes = [
+        helper.make_node("Gather", ["pixel_position_ids", "x_axis"], ["x_positions"], axis=2),
+        helper.make_node("Greater", ["x_positions", "negative_one"], ["valid_mask"]),
+        helper.make_node("NonZero", ["valid_mask"], ["valid_indices_transposed"]),
+        helper.make_node("Transpose", ["valid_indices_transposed"], ["valid_indices"], perm=[1, 0]),
+        helper.make_node("GatherND", ["vision_features", "valid_indices"], ["valid_patches"]),
+        helper.make_node(
+            "Slice", ["valid_patches", "slice_start", "slice_end", "slice_axis", "slice_step"], ["pooled_patches"]
+        ),
+        helper.make_node("Pad", ["pooled_patches", "feature_padding", "zero"], ["image_features"]),
+    ]
+    initializers = [
+        onnx.numpy_helper.from_array(np.array(0, dtype=np.int64), "x_axis"),
+        onnx.numpy_helper.from_array(np.array(-1, dtype=np.int64), "negative_one"),
+        onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), "slice_start"),
+        onnx.numpy_helper.from_array(np.array([np.iinfo(np.int64).max], dtype=np.int64), "slice_end"),
+        onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), "slice_axis"),
+        onnx.numpy_helper.from_array(np.array([9], dtype=np.int64), "slice_step"),
+        onnx.numpy_helper.from_array(np.array([0, 0, 0, 1280], dtype=np.int64), "feature_padding"),
+        onnx.numpy_helper.from_array(np.array(0, dtype=np.float32), "zero"),
+    ]
+    projector_graph = helper.make_graph(
+        projector_nodes,
+        "gemma4_vision_projector",
+        [vision_features, position_ids],
+        [image_features],
+        initializers,
+    )
+    projector = helper.make_model(projector_graph, opset_imports=[helper.make_opsetid("", 14)], ir_version=7)
+    onnx.save(projector, projector_path)
+
+
 def _create_dynamic_embedding_model(onnx, output_path):
     """Create an embedding fixture whose output follows the input prompt shape."""
     helper = onnx.helper
@@ -323,6 +373,57 @@ def test_gemma4_static_batch_vision_executes_multiple_images(test_data_path, tmp
     params.set_search_options(max_length=4096)
     generator = og.Generator(model, params)
     generator.set_inputs(inputs)
+
+
+@pytest.mark.parametrize(
+    "relative_image_paths",
+    [[Path("images") / "australia.jpg", Path("images") / "sheet.png"]],
+)
+def test_gemma4_split_vision_executes_multiple_images(test_data_path, tmp_path, relative_image_paths):
+    """Test that Gemma4 runs an encoder and projector once per image."""
+    onnx = pytest.importorskip("onnx")
+    source_model_path = Path(_get_gemma4_model_path(test_data_path))
+    model_path = tmp_path / "gemma4"
+    shutil.copytree(source_model_path, model_path)
+
+    config_path = model_path / "genai_config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["model"]["speech"] = {"filename": "", "config_filename": ""}
+    config["model"]["vocab_size"] = 8
+    config["model"]["eos_token_id"] = [1]
+    config["model"]["vision"]["pipeline"] = {
+        "encoder": {
+            "filename": "dummy_vision_encoder.onnx",
+            "inputs": ["pixel_values", "pixel_position_ids"],
+            "outputs": ["vision_features"],
+        },
+        "projector": {
+            "filename": "dummy_vision_projector.onnx",
+            "inputs": ["vision_features", "pixel_position_ids"],
+            "outputs": ["image_features"],
+        },
+    }
+    config["search"]["past_present_share_buffer"] = False
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    _create_static_batch_vision_pipeline(
+        onnx,
+        model_path / "dummy_vision_encoder.onnx",
+        model_path / "dummy_vision_projector.onnx",
+    )
+    _create_dynamic_embedding_model(onnx, model_path / "dummy_embedding.onnx")
+    _create_dynamic_decoder_model(onnx, model_path / "dummy_text.onnx")
+
+    model = og.Model(os.fspath(model_path))
+    processor = model.create_multimodal_processor()
+    image_paths = [os.fspath(_get_test_media_path(test_data_path, path)) for path in relative_image_paths]
+    images = og.Images.open(*image_paths)
+    inputs = processor("<|image|><|image|>Compare these images", images=images)
+
+    params = og.GeneratorParams(model)
+    params.set_search_options(max_length=4096)
+    generator = og.Generator(model, params)
+    generator.set_inputs(inputs)
+    generator.generate_next_token()
 
 
 @pytest.mark.parametrize(
