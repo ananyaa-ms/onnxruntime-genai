@@ -447,7 +447,7 @@ std::unique_ptr<NamedTensors> Gemma4MultiModalProcessor::Process(const Tokenizer
         auto create_position_ids = [&](auto value_type) {
           using T = decltype(value_type);
           auto processed_pos = OrtValue::CreateTensor<T>(allocator, processed_pos_shape);
-          auto* dst = processed_pos->GetTensorMutableData<T>();
+          auto* dst = processed_pos->template GetTensorMutableData<T>();
           std::fill_n(dst, pos_batch * target_patches * pos_last_dim, static_cast<T>(-1));
           const size_t src_stride = static_cast<size_t>(num_padded_pos * pos_last_dim);
           const size_t dst_stride = static_cast<size_t>(target_patches * pos_last_dim);
