@@ -131,7 +131,7 @@ MultiModalLanguageModel::MultiModalLanguageModel(std::unique_ptr<Config> config,
               options.providers.clear();
               options.provider_options.clear();
             }
-            CreateSessionOptionsFromConfig(options, *session_options, true, /*disable_graph_capture=*/true);
+            CreateSessionOptionsFromConfig(options, *session_options, false, /*disable_graph_capture=*/true);
             return CreateSession(ort_env, stage.filename, session_options.get());
           };
 
